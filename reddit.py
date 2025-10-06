@@ -13,9 +13,34 @@ import os
 import logging
 from dotenv import load_dotenv
 import time
+from functools import wraps
 
 # Load environment variables
 load_dotenv()
+
+# Rate limiting configuration for Gemini API
+RATE_LIMIT_DELAY = 2.0  # Seconds between API calls (30 calls per minute = 2 second delay)
+MAX_RETRIES = 3
+RETRY_DELAY = 60  # Initial retry delay in seconds
+
+class RateLimiter:
+    """Rate limiter for API calls with exponential backoff"""
+    def __init__(self, delay=RATE_LIMIT_DELAY):
+        self.delay = delay
+        self.last_call_time = 0
+    
+    def wait(self):
+        """Wait if needed to respect rate limits"""
+        current_time = time.time()
+        time_since_last_call = current_time - self.last_call_time
+        if time_since_last_call < self.delay:
+            sleep_time = self.delay - time_since_last_call
+            time.sleep(sleep_time)
+        self.last_call_time = time.time()
+
+# Global rate limiter instance
+rate_limiter = RateLimiter()
+api_call_counter = {"count": 0}  # Mutable object to track API calls across function calls
 
 # Suppress gRPC ALTS warning
 logging.getLogger('grpc._cython.cygrpc').setLevel(logging.ERROR)
@@ -25,6 +50,44 @@ os.environ['GRPC_TRACE'] = ''
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def retry_with_exponential_backoff(max_retries=MAX_RETRIES, base_delay=RETRY_DELAY):
+    """Decorator to retry function with exponential backoff on rate limit errors"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            retries = 0
+            while retries < max_retries:
+                try:
+                    # Wait before making the call (rate limiting)
+                    rate_limiter.wait()
+                    result = func(*args, **kwargs)
+                    api_call_counter["count"] += 1  # Increment counter on successful call
+                    return result
+                except Exception as e:
+                    error_str = str(e)
+                    # Check if it's a rate limit error (429 or quota exceeded)
+                    if '429' in error_str or 'quota' in error_str.lower() or 'rate limit' in error_str.lower():
+                        retries += 1
+                        if retries >= max_retries:
+                            logger.error(f"Max retries ({max_retries}) exceeded for rate limit error")
+                            raise
+                        
+                        # Extract retry delay from error message if available
+                        retry_match = re.search(r'retry in ([0-9.]+)s', error_str)
+                        if retry_match:
+                            wait_time = float(retry_match.group(1)) + 1  # Add 1 second buffer
+                        else:
+                            wait_time = base_delay * (2 ** (retries - 1))  # Exponential backoff
+                        
+                        logger.warning(f"Rate limit hit. Retry {retries}/{max_retries} in {wait_time:.1f}s")
+                        time.sleep(wait_time)
+                    else:
+                        # Not a rate limit error, raise immediately
+                        raise
+            return None
+        return wrapper
+    return decorator
 
 # Page config
 st.set_page_config(
@@ -60,6 +123,9 @@ st.sidebar.subheader("🤖 AI Settings")
 summary_length = st.sidebar.radio("Summary Length", ["Brief", "Detailed", "Comprehensive"])
 enable_sentiment = st.sidebar.checkbox("Enable Sentiment Analysis", value=True)
 
+# Add rate limit warning
+st.sidebar.info("⚠️ **API Rate Limits:**\n\nGemini free tier: 50 requests/day\n\n• Each post = 2 API calls (summary + sentiment)\n• Each comment sentiment = 1 call\n• Overall analysis = 1 call\n\n💡 **Tip:** Reduce posts/comments or disable sentiment to save API calls.")
+
 st.sidebar.markdown("---")
 
 # Visualization Settings
@@ -76,39 +142,45 @@ def clean_text(text):
     return text.lower()
 
 
+@retry_with_exponential_backoff()
 def analyze_sentiment_gemini(text, gemini_model):
-    """Analyze sentiment using Gemini with better error handling"""
+    """Analyze sentiment using Gemini with better error handling and rate limiting"""
     if not text or not text.strip():
         return {"label": "Neutral", "score": 0.5}
     
-    try:
-        # Limit text to reasonable size (3000 chars for better context)
-        text_sample = text[:3000]
-        
-        prompt = f"""Analyze the overall sentiment of this Reddit discussion and respond with ONLY one word: Positive, Neutral, or Negative.
+    # Limit text to reasonable size (3000 chars for better context)
+    text_sample = text[:3000]
+    
+    prompt = f"""Analyze the overall sentiment of this Reddit discussion and respond with ONLY one word: Positive, Neutral, or Negative.
 
 Consider the tone, emotions, and opinions expressed across all the text.
 
 Text: {text_sample}
 
 Sentiment:"""
-        
-        response = gemini_model.generate_content(prompt)
-        sentiment = response.text.strip()
-        
-        # Map to score
-        score_map = {"Positive": 0.8, "Neutral": 0.5, "Negative": 0.2}
-        
-        if sentiment not in score_map:
-            logger.warning(f"Unexpected sentiment response: {sentiment}")
-            sentiment = "Neutral"
-        
-        return {
-            "label": sentiment,
-            "score": score_map[sentiment]
-        }
+    
+    response = gemini_model.generate_content(prompt)
+    sentiment = response.text.strip()
+    
+    # Map to score
+    score_map = {"Positive": 0.8, "Neutral": 0.5, "Negative": 0.2}
+    
+    if sentiment not in score_map:
+        logger.warning(f"Unexpected sentiment response: {sentiment}")
+        sentiment = "Neutral"
+    
+    return {
+        "label": sentiment,
+        "score": score_map[sentiment]
+    }
+
+
+def analyze_sentiment_safe(text, gemini_model):
+    """Safe wrapper for sentiment analysis with error handling"""
+    try:
+        return analyze_sentiment_gemini(text, gemini_model)
     except Exception as e:
-        logger.error(f"Sentiment analysis failed: {str(e)}")
+        logger.error(f"Sentiment analysis failed after retries: {str(e)}")
         return {"label": "Neutral", "score": 0.5, "error": str(e)}
 
 
@@ -186,6 +258,10 @@ def fetch_reddit_data_optimized(reddit, subreddit_name, limit, time_filter, min_
         if post.score < min_upvotes:
             continue
         
+        # Skip AutoModerator posts
+        if post.author and str(post.author).lower() == 'automoderator':
+            continue
+        
         # Check if keywords match in title/selftext
         post_text = f"{post.title} {post.selftext}".lower()
         post_has_keyword = not keywords_list or any(kw.lower() in post_text for kw in keywords_list)
@@ -200,6 +276,10 @@ def fetch_reddit_data_optimized(reddit, subreddit_name, limit, time_filter, min_
         
         for comment in all_comments:
             if hasattr(comment, 'body'):
+                # Skip AutoModerator comments
+                if comment.author and str(comment.author).lower() == 'automoderator':
+                    continue
+                
                 # Check for keyword matches
                 if keywords_list:
                     comment_text = comment.body.lower()
@@ -218,12 +298,12 @@ def fetch_reddit_data_optimized(reddit, subreddit_name, limit, time_filter, min_
                             })
                             break
         
-        # Get top comments by score
+        # Get top comments by score (excluding AutoModerator)
         sorted_comments = sorted(all_comments, key=lambda x: x.score if hasattr(x, 'score') else 0, reverse=True)
         top_comments_data = [
             {"body": c.body, "score": c.score}
             for c in sorted_comments[:num_comments_per_post]
-            if hasattr(c, 'body')
+            if hasattr(c, 'body') and c.author and str(c.author).lower() != 'automoderator'
         ]
         
         # Include post if it has keyword in post OR in comments
@@ -231,7 +311,7 @@ def fetch_reddit_data_optimized(reddit, subreddit_name, limit, time_filter, min_
             posts_data.append({
                 'post': post,
                 'top_comments': top_comments_data,
-                'all_comments_text': ' '.join([c.body for c in sorted_comments[:num_comments_per_post] if hasattr(c, 'body')]),
+                'all_comments_text': ' '.join([c.body for c in sorted_comments[:num_comments_per_post] if hasattr(c, 'body') and c.author and str(c.author).lower() != 'automoderator']),
                 'match_type': 'post' if post_has_keyword else 'comment_only'
             })
             
@@ -244,6 +324,13 @@ def fetch_reddit_data_optimized(reddit, subreddit_name, limit, time_filter, min_
         time.sleep(0.1)
     
     return posts_data, individual_comments
+
+
+@retry_with_exponential_backoff()
+def generate_summary_with_retry(prompt, gemini_model):
+    """Generate summary with retry and rate limiting"""
+    response = gemini_model.generate_content(prompt)
+    return response.text.strip()
 
 
 def analyze_post_with_gemini(post_data, gemini_model, summary_length, enable_sentiment):
@@ -266,7 +353,7 @@ def analyze_post_with_gemini(post_data, gemini_model, summary_length, enable_sen
         "Comprehensive": "with detailed analysis including key points and implications"
     }
     
-    # Generate summary
+    # Generate summary with retry logic
     summary_prompt = f"""Summarize this Reddit post and its top comments {detail_map[summary_length]}.
 
 Post:
@@ -277,19 +364,12 @@ Top Comments:
 
 Summary:"""
     
-    try:
-        summary_response = gemini_model.generate_content(summary_prompt)
-        summary = summary_response.text.strip()
-        time.sleep(0.5)  # Rate limiting
-    except Exception as e:
-        logger.error(f"Summary generation failed: {str(e)}")
-        summary = "Unable to generate summary."
+    summary = generate_summary_safe(summary_prompt, gemini_model)
     
     # Analyze sentiment if enabled
     sentiment = None
     if enable_sentiment:
-        sentiment = analyze_sentiment_gemini(combined_text, gemini_model)
-        time.sleep(0.5)  # Rate limiting
+        sentiment = analyze_sentiment_safe(combined_text, gemini_model)
     
     return {
         "id": post.id,
@@ -309,23 +389,59 @@ Summary:"""
     }
 
 
+def generate_summary_safe(prompt, gemini_model):
+    """Safe wrapper for summary generation"""
+    try:
+        return generate_summary_with_retry(prompt, gemini_model)
+    except Exception as e:
+        logger.error(f"Summary generation failed after retries: {str(e)}")
+        return "Unable to generate summary due to API limits."
+
+
 def analyze_individual_comments_sentiment(individual_comments, gemini_model, enable_sentiment):
-    """Analyze sentiment for individual comment mentions"""
+    """Analyze sentiment for individual comment mentions with rate limiting"""
     if not enable_sentiment or not individual_comments:
         return individual_comments
     
     analyzed_comments = []
     
     for idx, comment in enumerate(individual_comments):
-        sentiment = analyze_sentiment_gemini(comment['comment_body'], gemini_model)
+        sentiment = analyze_sentiment_safe(comment['comment_body'], gemini_model)
         comment['sentiment'] = sentiment
         analyzed_comments.append(comment)
-        
-        # Rate limiting and progress
-        if idx % 10 == 0 and idx > 0:
-            time.sleep(1)
     
     return analyzed_comments
+
+
+@retry_with_exponential_backoff()
+def generate_overall_analysis_with_retry(prompt, gemini_model):
+    """Generate overall analysis with retry and rate limiting"""
+    response = gemini_model.generate_content(prompt)
+    return response.text.strip()
+
+
+def generate_overall_analysis_safe(prompt, gemini_model):
+    """Safe wrapper for overall analysis generation"""
+    try:
+        return generate_overall_analysis_with_retry(prompt, gemini_model)
+    except Exception as e:
+        logger.error(f"Overall analysis failed after retries: {str(e)}")
+        error_msg = str(e)
+        if '429' in error_msg or 'quota' in error_msg.lower():
+            return f"""⚠️ **API Rate Limit Reached**
+
+The Gemini API free tier has a limit of 50 requests per day. Your analysis has exceeded this quota.
+
+**What happened:** The application made too many API requests while analyzing posts and comments.
+
+**Solutions:**
+1. Wait for the rate limit to reset (check the error message for timing)
+2. Reduce the number of posts to analyze
+3. Disable sentiment analysis to reduce API calls
+4. Upgrade to Gemini API paid tier for higher limits
+
+**Error details:** {error_msg}"""
+        return f"Unable to generate overall analysis: {error_msg}"
 
 
 def generate_overall_analysis(results, gemini_model, brand_keywords, individual_comments_with_sentiment):
@@ -377,18 +493,12 @@ Provide a comprehensive analysis covering:
 
 Be specific, actionable, and data-driven in your analysis."""
 
-    try:
-        response = gemini_model.generate_content(analysis_prompt)
-        return {
-            "analysis": response.text.strip(),
-            "brand_health": brand_health
-        }
-    except Exception as e:
-        logger.error(f"Overall analysis failed: {str(e)}")
-        return {
-            "analysis": f"Unable to generate overall analysis: {str(e)}",
-            "brand_health": brand_health
-        }
+    analysis_text = generate_overall_analysis_safe(analysis_prompt, gemini_model)
+    
+    return {
+        "analysis": analysis_text,
+        "brand_health": brand_health
+    }
 
 
 # Main App
@@ -439,8 +549,26 @@ with col3:
 
 st.markdown("---")
 
+# Estimate API calls
+if keywords or subreddit_input:
+    estimated_post_calls = num_posts * (2 if enable_sentiment else 1)  # summary + sentiment per post
+    estimated_comment_calls = 0  # Will depend on matches found
+    estimated_total = estimated_post_calls + 1  # +1 for overall analysis
+    
+    st.info(f"""
+📊 **Estimated API Calls:** ~{estimated_total} calls
+- {num_posts} posts × {'2 (summary + sentiment)' if enable_sentiment else '1 (summary only)'} = {estimated_post_calls} calls
+- Overall analysis = 1 call
+- Comment sentiment calls will depend on keyword matches found
+    
+💡 **Free tier limit:** 50 calls/day
+    """)
+
 # Run Analysis
 if run_analysis:
+    # Reset API call counter
+    api_call_counter["count"] = 0
+    
     try:
         # Initialize APIs
         with st.spinner("🔧 Initializing APIs..."):
@@ -527,6 +655,9 @@ if run_analysis:
         
         total_mentions = len(all_results) + len(all_individual_comments)
         st.success(f"✅ Analysis complete! Found {total_mentions} total mentions ({len(all_results)} posts, {len(all_individual_comments)} comments)")
+        
+        # Display API usage
+        st.info(f"📊 **API Calls Used:** {api_call_counter['count']} / 50 (free tier daily limit)\n\n{'⚠️ Getting close to limit!' if api_call_counter['count'] > 40 else '✅ Within safe limits' if api_call_counter['count'] <= 30 else '🔶 Moderate usage'}")
         
     except Exception as e:
         st.error(f"❌ Error: {str(e)}")
