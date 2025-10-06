@@ -1,0 +1,7 @@
+streamlit
+praw
+google-generativeai
+wordcloud
+plotly
+pandas
+Pillow
