@@ -77,7 +77,7 @@ def retry_with_exponential_backoff(max_retries=MAX_RETRIES, base_delay=RETRY_DEL
     return decorator
 
 # Page config
-st.set_page_config(page_title="Reddit Insight Broadcaster", page_icon="🔎", layout="wide")
+st.set_page_config(page_title="Reddit Insights", page_icon="🔎", layout="wide")
 
 # Initialize session state
 if 'analysis_results' not in st.session_state:
@@ -373,8 +373,8 @@ Provide analysis with:
     return {"analysis": analysis_text, "brand_health": brand_health}
 
 # Main App
-st.title("🔎 Reddit Insight Broadcaster")
-st.markdown("**AI-Powered Brand Monitoring & Sentiment Analysis**")
+st.title("🔎 Reddit Insights")
+st.markdown("**AI-Powered  Monitoring & Sentiment Analysis**")
 
 # Check credentials
 reddit_client_id = os.getenv("REDDIT_CLIENT_ID")
@@ -510,14 +510,14 @@ if st.session_state.analysis_results or st.session_state.individual_comments:
     
     # TAB 1: Overview
     with tab1:
-        st.header("📊 Brand Health Overview")
+        st.header("📊Overview")
         
         if overall_analysis and overall_analysis.get('brand_health'):
             brand_health = overall_analysis['brand_health']
             
             col1, col2, col3, col4, col5 = st.columns(5)
             health_color = "🟢" if brand_health['health_score'] >= 70 else "🟡" if brand_health['health_score'] >= 40 else "🔴"
-            col1.metric("Brand Health", f"{health_color} {brand_health['health_score']}/100")
+            col1.metric("Overall Sentiment", f"{health_color} {brand_health['health_score']}/100")
             col2.metric("Total Mentions", brand_health['total_mentions'])
             col3.metric("Posts", brand_health['post_mentions'])
             col4.metric("Comments", brand_health['comment_mentions'])
@@ -790,8 +790,12 @@ if st.session_state.analysis_results or st.session_state.individual_comments:
                                             'Comments': 0, 'Subreddit': c['subreddit']})
                     
                     df_timeline = pd.DataFrame(timeline_data).sort_values('Time')
+                    # Create size column with positive values (add offset to handle negative scores)
+                    min_score = df_timeline['Score'].min()
+                    df_timeline['BubbleSize'] = df_timeline['Score'] + abs(min_score) + 1 if min_score < 0 else df_timeline['Score'] + 1
+                    
                     fig = px.scatter(df_timeline, x='Time', y='Score', hover_data=['Title', 'Subreddit', 'Comments'],
-                                   title='Activity Timeline', template=chart_theme, size='Score',
+                                   title='Activity Timeline', template=chart_theme, size='BubbleSize',
                                    color='Type', color_discrete_map={'Post': 'blue', 'Comment': 'orange'})
                     st.plotly_chart(fig, use_container_width=True)
                     
