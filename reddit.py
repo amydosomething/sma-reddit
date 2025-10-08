@@ -13,14 +13,18 @@ import logging
 from dotenv import load_dotenv
 import time
 from functools import wraps
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+import networkx as nx
+from collections import defaultdict
 
 # Load environment variables
 load_dotenv()
 
-# ===== CONFIGURATION - ADJUST THESE TWO SETTINGS ONLY =====
-GEMINI_MODEL = 'gemini-2.5-flash'  # Change model here
+# ===== CONFIGURATION - ADJUST THESE SETTINGS =====
+GEMINI_MODEL = 'gemini-2.5-flash'  # For summaries only
 RATE_LIMIT_DELAY = 5  # Seconds between API calls
-# ==========================================================
+NETWORK_DISCOVERY_LIMIT = 50  # Max discovered subreddits
+# =================================================
 
 MAX_RETRIES = 3
 RETRY_DELAY = 60
@@ -40,6 +44,9 @@ class RateLimiter:
 
 rate_limiter = RateLimiter()
 api_call_counter = {"count": 0}
+
+# Initialize VADER
+vader_analyzer = SentimentIntensityAnalyzer()
 
 # Suppress warnings
 logging.getLogger('grpc._cython.cygrpc').setLevel(logging.ERROR)
@@ -86,6 +93,8 @@ if 'overall_analysis' not in st.session_state:
     st.session_state.overall_analysis = None
 if 'individual_comments' not in st.session_state:
     st.session_state.individual_comments = None
+if 'network_data' not in st.session_state:
+    st.session_state.network_data = None
 
 # Sidebar
 st.sidebar.title("⚙️ Configuration")
@@ -100,9 +109,10 @@ time_filter = st.sidebar.selectbox("Time Period", ["day", "week", "month", "year
 st.sidebar.markdown("---")
 st.sidebar.subheader("🤖 AI Settings")
 summary_length = st.sidebar.radio("Summary Length", ["Brief", "Detailed", "Comprehensive"])
-enable_sentiment = st.sidebar.checkbox("Enable Sentiment Analysis", value=True)
+enable_sentiment = st.sidebar.checkbox("Enable Sentiment Analysis (VADER)", value=True)
+enable_network = st.sidebar.checkbox("Enable Network Discovery", value=True)
 
-st.sidebar.info(f"Using model: {GEMINI_MODEL}\nDelay: {RATE_LIMIT_DELAY}s between calls\nBatch processing enabled")
+st.sidebar.info(f"Sentiment: VADER (instant)\nSummaries: {GEMINI_MODEL}\nDelay: {RATE_LIMIT_DELAY}s")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("📊 Visualization Settings")
@@ -115,55 +125,130 @@ def clean_text(text):
     text = re.sub(r'[^a-zA-Z\s]', '', text)
     return text.lower()
 
-@retry_with_exponential_backoff()
-def analyze_sentiment_batch(texts, gemini_model, batch_size=20):
-    """Batch sentiment analysis"""
-    all_results = []
+def analyze_sentiment_vader(text):
+    """Analyze sentiment using VADER - instant, no API calls"""
+    if not text or len(text.strip()) == 0:
+        return {"label": "Neutral", "score": 0.5}
     
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i+batch_size]
-        
-        prompt = """Analyze sentiment for each text. Respond with ONLY a JSON array.
-Format: ["Positive", "Neutral", "Negative", ...]
+    scores = vader_analyzer.polarity_scores(text)
+    compound = scores['compound']
+    
+    # Map compound score to label and 0-1 scale
+    if compound >= 0.05:
+        label = "Positive"
+        score = 0.5 + (compound * 0.5)  # Maps 0.05-1.0 to 0.525-1.0
+    elif compound <= -0.05:
+        label = "Negative"
+        score = 0.5 + (compound * 0.5)  # Maps -1.0 to -0.05 to 0.0-0.475
+    else:
+        label = "Neutral"
+        score = 0.5
+    
+    return {
+        "label": label,
+        "score": round(score, 2),
+        "compound": round(compound, 3),
+        "raw_scores": scores
+    }
 
-Texts:
-"""
-        for idx, text in enumerate(batch, 1):
-            text_sample = text[:800] if text else ""
-            prompt += f"\n{idx}. {text_sample}\n"
-        
-        prompt += "\nJSON array:"
-        
-        response = gemini_model.generate_content(prompt)
-        response_text = response.text.strip()
-        
-        try:
-            if '```json' in response_text:
-                response_text = response_text.split('```json')[1].split('```')[0]
-            elif '```' in response_text:
-                response_text = response_text.split('```')[1].split('```')[0]
-            
-            match = re.search(r'\[.*?\]', response_text, re.DOTALL)
-            if match:
-                response_text = match.group(0)
-            
-            sentiments = json.loads(response_text.strip())
-            
-            if len(sentiments) != len(batch):
-                sentiments = (sentiments + ['Neutral'] * len(batch))[:len(batch)]
-            
-            score_map = {"Positive": 0.8, "Neutral": 0.5, "Negative": 0.2}
-            for sentiment in sentiments:
-                sentiment = str(sentiment).strip()
-                all_results.append({
-                    "label": sentiment if sentiment in score_map else "Neutral",
-                    "score": score_map.get(sentiment, 0.5)
-                })
-        except Exception as e:
-            logger.error(f"Batch parsing failed: {e}")
-            all_results.extend([{"label": "Neutral", "score": 0.5}] * len(batch))
+def discover_related_subreddits(reddit, keywords_list, limit=NETWORK_DISCOVERY_LIMIT):
+    """Discover subreddits where keywords are discussed"""
+    discovered = defaultdict(lambda: {"mentions": 0, "posts": [], "comments": 0})
     
-    return all_results
+    try:
+        for keyword in keywords_list[:3]:  # Limit keyword search
+            search_results = reddit.subreddit("all").search(keyword, limit=limit, time_filter="month")
+            
+            for post in search_results:
+                sub_name = post.subreddit.display_name
+                discovered[sub_name]["mentions"] += 1
+                discovered[sub_name]["posts"].append({
+                    "title": post.title,
+                    "score": post.score,
+                    "url": f"https://reddit.com{post.permalink}"
+                })
+                
+                if len(discovered) >= limit:
+                    break
+            
+            if len(discovered) >= limit:
+                break
+            
+            time.sleep(0.5)
+    except Exception as e:
+        logger.error(f"Discovery error: {e}")
+    
+    return dict(discovered)
+
+def calculate_network_metrics(G):
+    """Calculate network centrality metrics"""
+    metrics = {}
+    
+    try:
+        # Degree Centrality
+        metrics['degree'] = nx.degree_centrality(G)
+        
+        # Betweenness Centrality
+        metrics['betweenness'] = nx.betweenness_centrality(G)
+        
+        # Eigenvector Centrality (if graph is connected enough)
+        try:
+            metrics['eigenvector'] = nx.eigenvector_centrality(G, max_iter=1000)
+        except:
+            metrics['eigenvector'] = {node: 0 for node in G.nodes()}
+        
+        # PageRank
+        metrics['pagerank'] = nx.pagerank(G)
+        
+        # Closeness Centrality (for connected components)
+        if nx.is_connected(G.to_undirected()):
+            metrics['closeness'] = nx.closeness_centrality(G)
+        else:
+            metrics['closeness'] = {node: 0 for node in G.nodes()}
+        
+    except Exception as e:
+        logger.error(f"Metrics calculation error: {e}")
+    
+    return metrics
+
+def build_subreddit_network(posts_data, individual_comments, discovered_subreddits, input_subreddits):
+    """Build network graph of subreddit relationships"""
+    G = nx.DiGraph()
+    edge_weights = defaultdict(int)
+    
+    # Add input subreddits as main nodes
+    for sub in input_subreddits:
+        G.add_node(sub, type='input', mentions=0)
+    
+    # Add discovered subreddits
+    for sub, data in discovered_subreddits.items():
+        if sub not in input_subreddits:
+            G.add_node(sub, type='discovered', mentions=data['mentions'])
+    
+    # Count mentions in input subreddits
+    for post_data in posts_data:
+        sub = post_data['post'].subreddit.display_name
+        if sub in G.nodes():
+            G.nodes[sub]['mentions'] = G.nodes[sub].get('mentions', 0) + 1
+    
+    for comment in individual_comments:
+        sub = comment['subreddit']
+        if sub in G.nodes():
+            G.nodes[sub]['mentions'] = G.nodes[sub].get('mentions', 0) + 1
+    
+    # Create edges between input and discovered subreddits
+    for input_sub in input_subreddits:
+        for disc_sub in discovered_subreddits:
+            if disc_sub != input_sub:
+                # Edge weight based on keyword co-occurrence
+                weight = discovered_subreddits[disc_sub]['mentions']
+                if weight > 0:
+                    G.add_edge(input_sub, disc_sub, weight=weight)
+    
+    # Calculate metrics
+    metrics = calculate_network_metrics(G)
+    
+    return G, metrics
 
 def calculate_brand_health_score(post_results, individual_comments_with_sentiment):
     """Calculate brand health metrics"""
@@ -279,7 +364,7 @@ def generate_summary_with_retry(prompt, gemini_model):
     return response.text.strip()
 
 def analyze_post_with_gemini(post_data, gemini_model, summary_length):
-    """Analyze post - summary only"""
+    """Analyze post - summary only (sentiment handled by VADER)"""
     post = post_data['post']
     top_comments = post_data['top_comments']
     all_comments_text = post_data['all_comments_text']
@@ -374,7 +459,7 @@ Provide analysis with:
 
 # Main App
 st.title("🔎 Reddit Insights")
-st.markdown("**AI-Powered  Monitoring & Sentiment Analysis**")
+st.markdown("**AI-Powered Monitoring & Sentiment Analysis with Network Discovery**")
 
 # Check credentials
 reddit_client_id = os.getenv("REDDIT_CLIENT_ID")
@@ -397,7 +482,8 @@ with col2:
             data=json.dumps({
                 "posts": st.session_state.analysis_results,
                 "individual_comments": st.session_state.individual_comments,
-                "overall_analysis": st.session_state.overall_analysis
+                "overall_analysis": st.session_state.overall_analysis,
+                "network_data": st.session_state.network_data
             }, indent=2, default=str),
             file_name=f"reddit_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
             mime="application/json",
@@ -408,19 +494,21 @@ with col3:
         st.session_state.analysis_results = None
         st.session_state.overall_analysis = None
         st.session_state.individual_comments = None
+        st.session_state.network_data = None
         st.rerun()
 
 st.markdown("---")
 
-# Estimate API calls
+# Estimate API calls (reduced because VADER is instant)
 if keywords or subreddit_input:
     estimated_post_summaries = num_posts
-    estimated_post_sentiment_batches = max(1, (num_posts + 19) // 20) if enable_sentiment else 0
-    estimated_total = estimated_post_summaries + estimated_post_sentiment_batches + 1
+    estimated_total = estimated_post_summaries + 1  # Only summaries + overall analysis
     estimated_time_minutes = (estimated_total * RATE_LIMIT_DELAY) / 60
     
     st.info(f"""
-📊 **Estimated:** ~{estimated_total} API calls, ~{estimated_time_minutes:.1f} minutes
+📊 **Estimated:** ~{estimated_total} API calls (summaries only), ~{estimated_time_minutes:.1f} minutes
+💡 **Sentiment Analysis:** VADER (instant, no API calls)
+🌐 **Network Discovery:** {'Enabled' if enable_network else 'Disabled'}
 
 API calls tracked: {api_call_counter['count']}
     """)
@@ -444,13 +532,17 @@ if run_analysis:
         
         all_results = []
         all_individual_comments = []
+        all_posts_data = []
         
+        # Fetch data from INPUT subreddits only
         for subreddit_name in subreddits:
             st.info(f"Searching r/{subreddit_name}...")
             
             posts_data, individual_comments = fetch_reddit_data_optimized(
                 reddit, subreddit_name, num_posts, time_filter, min_upvotes, keywords_list, num_comments
             )
+            
+            all_posts_data.extend(posts_data)
             
             if posts_data:
                 progress_bar = st.progress(0)
@@ -459,23 +551,45 @@ if run_analysis:
                     all_results.append(result)
                     progress_bar.progress((idx + 1) / len(posts_data))
                 progress_bar.empty()
-                
-                if enable_sentiment and all_results:
-                    with st.spinner("Analyzing sentiment..."):
-                        post_texts = [r['combined_text'] for r in all_results]
-                        post_sentiments = analyze_sentiment_batch(post_texts, gemini_model, 20)
-                        for result, sentiment in zip(all_results, post_sentiments):
-                            result['sentiment'] = sentiment
             
             all_individual_comments.extend(individual_comments)
         
+        # VADER Sentiment Analysis (instant!)
+        if enable_sentiment and all_results:
+            with st.spinner("Analyzing sentiment with VADER..."):
+                for result in all_results:
+                    sentiment = analyze_sentiment_vader(result['combined_text'])
+                    result['sentiment'] = sentiment
+        
         if all_individual_comments and enable_sentiment:
             with st.spinner("Analyzing comment sentiment..."):
-                comment_texts = [c['comment_body'] for c in all_individual_comments]
-                sentiments = analyze_sentiment_batch(comment_texts, gemini_model, 20)
-                for comment, sentiment in zip(all_individual_comments, sentiments):
+                for comment in all_individual_comments:
+                    sentiment = analyze_sentiment_vader(comment['comment_body'])
                     comment['sentiment'] = sentiment
         
+        # Network Discovery (discovers OTHER subreddits)
+        discovered_subreddits = {}
+        if enable_network and keywords_list:
+            with st.spinner("Discovering related subreddits..."):
+                discovered_subreddits = discover_related_subreddits(reddit, keywords_list)
+                st.info(f"Discovered {len(discovered_subreddits)} related subreddits")
+        
+        # Build network
+        network_data = None
+        if discovered_subreddits or all_posts_data:
+            with st.spinner("Building network graph..."):
+                G, metrics = build_subreddit_network(
+                    all_posts_data, all_individual_comments, discovered_subreddits, subreddits
+                )
+                network_data = {
+                    "graph": nx.node_link_data(G),
+                    "metrics": {metric_name: {str(k): v for k, v in metric_dict.items()} 
+                               for metric_name, metric_dict in metrics.items()},
+                    "discovered_subreddits": discovered_subreddits
+                }
+                st.session_state.network_data = network_data
+        
+        # Overall analysis
         if all_results or all_individual_comments:
             with st.spinner("Generating analysis..."):
                 overall_analysis = generate_overall_analysis(
@@ -487,69 +601,70 @@ if run_analysis:
         st.session_state.analysis_results = all_results
         st.session_state.individual_comments = all_individual_comments
         
-        st.success(f"Complete! API calls used: {api_call_counter['count']}")
+        st.success(f"✅ Complete! API calls: {api_call_counter['count']} | Sentiment: VADER (instant)")
         
     except Exception as e:
         st.error(f"Error: {str(e)}")
+        logger.exception("Analysis error")
 
-# Display Results - COMPLETE VISUALIZATION CODE
+# Display Results
 if st.session_state.analysis_results or st.session_state.individual_comments:
     results = st.session_state.analysis_results or []
     individual_comments = st.session_state.individual_comments or []
     overall_analysis = st.session_state.overall_analysis
+    network_data = st.session_state.network_data
     
-    # Create tabs
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "📊 Overview & Metrics",
+    # Create tabs with Network Analysis
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "📊 Overview",
         "🤖 AI Insights", 
-        "📌 Individual Posts",
+        "📌 Posts",
         "💬 Comments",
         "📈 Visualizations",
-        "📉 Analytics"
+        "📉 Analytics",
+        "🌐 Network"
     ])
     
     # TAB 1: Overview
     with tab1:
-        st.header("📊Overview")
+        st.header("📊 Overview")
         
         if overall_analysis and overall_analysis.get('brand_health'):
             brand_health = overall_analysis['brand_health']
             
             col1, col2, col3, col4, col5 = st.columns(5)
             health_color = "🟢" if brand_health['health_score'] >= 70 else "🟡" if brand_health['health_score'] >= 40 else "🔴"
-            col1.metric("Overall Sentiment", f"{health_color} {brand_health['health_score']}/100")
+            col1.metric("Health Score", f"{health_color} {brand_health['health_score']}/100")
             col2.metric("Total Mentions", brand_health['total_mentions'])
             col3.metric("Posts", brand_health['post_mentions'])
             col4.metric("Comments", brand_health['comment_mentions'])
             col5.metric("Engagement", f"{brand_health['total_engagement']:,}")
             
             st.markdown("---")
-            st.subheader("😊 Sentiment Distribution")
+            st.subheader("😊 Sentiment Distribution (VADER)")
             col1, col2, col3 = st.columns(3)
             col1.metric("Positive", f"🟢 {brand_health['positive_ratio']}%")
             col2.metric("Neutral", f"🟡 {brand_health['neutral_ratio']}%")
             col3.metric("Negative", f"🔴 {brand_health['negative_ratio']}%")
             
             st.markdown("---")
-            st.subheader("📈 Engagement Metrics")
+            st.subheader("📈 Engagement")
             col1, col2, col3 = st.columns(3)
             col1.metric("Avg Upvotes", f"👍 {brand_health['avg_upvotes']}")
             col2.metric("Avg Comments", f"💬 {brand_health['avg_comments']}")
             col3.metric("Avg Sentiment", f"⭐ {brand_health['avg_sentiment']:.2f}/1.0")
-        else:
-            st.info("No metrics available")
     
     # TAB 2: AI Insights
     with tab2:
-        st.header("🤖 AI-Generated Insights")
+        st.header("🤖 AI Insights")
         if overall_analysis and overall_analysis.get('analysis'):
             st.markdown(overall_analysis['analysis'])
         else:
             st.info("No insights available")
     
-    # TAB 3: Individual Posts
+    # TAB 3: Posts
     with tab3:
-        st.header("📌 Individual Posts")
+        st.header("📌 Posts")
         st.markdown(f"**{len(results)}** posts analyzed")
         
         if results:
@@ -557,18 +672,18 @@ if st.session_state.analysis_results or st.session_state.individual_comments:
             with col1:
                 sort_by = st.selectbox("Sort by", ["Upvotes", "Comments", "Sentiment", "Date"])
             with col2:
-                sentiment_filter = st.selectbox("Filter by Sentiment", ["All", "Positive", "Neutral", "Negative"])
+                sentiment_filter = st.selectbox("Filter", ["All", "Positive", "Neutral", "Negative"])
             with col3:
-                match_filter = st.selectbox("Filter by Match", ["All", "Keyword in Post", "Keyword in Comments"])
+                match_filter = st.selectbox("Match", ["All", "Post", "Comments"])
             
             filtered_results = results.copy()
             
             if sentiment_filter != "All":
                 filtered_results = [r for r in filtered_results if r.get('sentiment') and r['sentiment']['label'] == sentiment_filter]
             
-            if match_filter == "Keyword in Post":
+            if match_filter == "Post":
                 filtered_results = [r for r in filtered_results if r.get('match_type') == 'post']
-            elif match_filter == "Keyword in Comments":
+            elif match_filter == "Comments":
                 filtered_results = [r for r in filtered_results if r.get('match_type') == 'comment_only']
             
             if sort_by == "Upvotes":
@@ -600,7 +715,8 @@ if st.session_state.analysis_results or st.session_state.individual_comments:
                     
                     if result.get('sentiment'):
                         sentiment_color = {'Positive': '🟢', 'Neutral': '🟡', 'Negative': '🔴'}
-                        st.markdown(f"**Sentiment:** {sentiment_color.get(result['sentiment']['label'], '⚪')} {result['sentiment']['label']}")
+                        compound = result['sentiment'].get('compound', 0)
+                        st.markdown(f"**Sentiment (VADER):** {sentiment_color.get(result['sentiment']['label'], '⚪')} {result['sentiment']['label']} (compound: {compound})")
                     
                     if result.get('selftext'):
                         with st.expander("📄 View Post Content"):
@@ -610,18 +726,16 @@ if st.session_state.analysis_results or st.session_state.individual_comments:
                         st.markdown("**💬 Top Comments:**")
                         for i, comment in enumerate(result['top_comments'][:5], 1):
                             st.markdown(f"{i}. \"{comment['body'][:300]}...\" (+{comment['score']})")
-        else:
-            st.info("No posts analyzed")
     
     # TAB 4: Comments
     with tab4:
-        st.header("💬 Individual Comments")
+        st.header("💬 Comments")
         st.markdown(f"**{len(individual_comments)}** comments")
         
         if individual_comments:
             col1, col2 = st.columns(2)
             with col1:
-                comment_sort = st.selectbox("Sort by", ["Score", "Date", "Sentiment"])
+                comment_sort = st.selectbox("Sort", ["Score", "Date", "Sentiment"])
             with col2:
                 comment_sentiment_filter = st.selectbox("Filter", ["All", "Positive", "Neutral", "Negative"], key="cf")
             
@@ -649,7 +763,8 @@ if st.session_state.analysis_results or st.session_state.individual_comments:
                     
                     if comment.get('sentiment'):
                         sentiment_color = {'Positive': '🟢', 'Neutral': '🟡', 'Negative': '🔴'}
-                        st.markdown(f"**Sentiment:** {sentiment_color.get(comment['sentiment']['label'], '⚪')} {comment['sentiment']['label']}")
+                        compound = comment['sentiment'].get('compound', 0)
+                        st.markdown(f"**Sentiment:** {sentiment_color.get(comment['sentiment']['label'], '⚪')} {comment['sentiment']['label']} (compound: {compound})")
                     
                     st.markdown(f"**Keyword:** `{comment['matched_keyword']}`")
                     st.markdown(f"**From:** [{comment['post_title'][:80]}...]({comment['post_url']})")
@@ -658,12 +773,10 @@ if st.session_state.analysis_results or st.session_state.individual_comments:
             
             if len(filtered_comments) > 100:
                 st.info(f"Showing top 100 of {len(filtered_comments)} comments")
-        else:
-            st.info("No comments found")
     
     # TAB 5: Visualizations
     with tab5:
-        st.header("📈 Visual Analytics")
+        st.header("📈 Visualizations")
         
         if results or individual_comments:
             viz_tab1, viz_tab2, viz_tab3, viz_tab4 = st.tabs(["Word Cloud", "Sentiment", "Engagement", "Timeline"])
@@ -688,16 +801,18 @@ if st.session_state.analysis_results or st.session_state.individual_comments:
                     st.plotly_chart(fig, use_container_width=True)
             
             with viz_tab2:
-                st.subheader("😊 Sentiment Analysis")
+                st.subheader("😊 Sentiment Analysis (VADER)")
                 
                 if enable_sentiment and (results or individual_comments):
                     all_sentiments = []
                     for r in results:
                         if r.get('sentiment'):
-                            all_sentiments.append({'source': 'Post', 'sentiment': r['sentiment']['label'], 'score': r['sentiment']['score']})
+                            all_sentiments.append({'source': 'Post', 'sentiment': r['sentiment']['label'], 
+                                                  'score': r['sentiment']['score'], 'compound': r['sentiment']['compound']})
                     for c in individual_comments:
                         if c.get('sentiment'):
-                            all_sentiments.append({'source': 'Comment', 'sentiment': c['sentiment']['label'], 'score': c['sentiment']['score']})
+                            all_sentiments.append({'source': 'Comment', 'sentiment': c['sentiment']['label'], 
+                                                  'score': c['sentiment']['score'], 'compound': c['sentiment']['compound']})
                     
                     if all_sentiments:
                         df_all_sentiment = pd.DataFrame(all_sentiments)
@@ -708,7 +823,7 @@ if st.session_state.analysis_results or st.session_state.individual_comments:
                             sentiment_counts = df_all_sentiment['sentiment'].value_counts().reset_index()
                             sentiment_counts.columns = ['Sentiment', 'Count']
                             fig = px.pie(sentiment_counts, values='Count', names='Sentiment',
-                                       title='Overall Sentiment',
+                                       title='Overall Sentiment Distribution',
                                        color='Sentiment',
                                        color_discrete_map={'Positive': 'green', 'Neutral': 'gray', 'Negative': 'red'},
                                        template=chart_theme)
@@ -723,26 +838,38 @@ if st.session_state.analysis_results or st.session_state.individual_comments:
                             st.plotly_chart(fig, use_container_width=True)
                         
                         st.markdown("---")
+                        st.subheader("VADER Compound Score Distribution")
+                        fig = px.histogram(df_all_sentiment, x='compound', nbins=30,
+                                         title='VADER Compound Score Distribution',
+                                         labels={'compound': 'Compound Score (-1 to 1)'},
+                                         template=chart_theme, color='source',
+                                         color_discrete_map={'Post': 'blue', 'Comment': 'orange'})
+                        fig.add_vline(x=0, line_dash="dash", line_color="gray", annotation_text="Neutral")
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        st.markdown("---")
                         time_data = []
                         for r in results:
                             if r.get('sentiment'):
                                 time_data.append({'Time': datetime.fromtimestamp(r['created_utc']),
                                                 'Sentiment Score': r['sentiment']['score'],
+                                                'Compound': r['sentiment']['compound'],
                                                 'Title': r['title'][:40] + '...', 'Type': 'Post'})
                         for c in individual_comments:
                             if c.get('sentiment'):
                                 time_data.append({'Time': datetime.fromtimestamp(c['created_utc']),
                                                 'Sentiment Score': c['sentiment']['score'],
+                                                'Compound': c['sentiment']['compound'],
                                                 'Title': c['comment_body'][:40] + '...', 'Type': 'Comment'})
                         
                         if time_data:
                             df_time = pd.DataFrame(time_data).sort_values('Time')
-                            fig = px.scatter(df_time, x='Time', y='Sentiment Score', hover_data=['Title'],
-                                           title='Sentiment Over Time', template=chart_theme,
+                            fig = px.scatter(df_time, x='Time', y='Compound', hover_data=['Title'],
+                                           title='Sentiment Over Time (VADER Compound Score)', template=chart_theme,
                                            color='Type', color_discrete_map={'Post': 'blue', 'Comment': 'orange'})
-                            fig.add_hline(y=0.5, line_dash="dash", line_color="gray", annotation_text="Neutral")
-                            fig.add_hline(y=0.8, line_dash="dot", line_color="green", annotation_text="Positive")
-                            fig.add_hline(y=0.2, line_dash="dot", line_color="red", annotation_text="Negative")
+                            fig.add_hline(y=0, line_dash="dash", line_color="gray", annotation_text="Neutral")
+                            fig.add_hline(y=0.05, line_dash="dot", line_color="green", annotation_text="Positive Threshold")
+                            fig.add_hline(y=-0.05, line_dash="dot", line_color="red", annotation_text="Negative Threshold")
                             st.plotly_chart(fig, use_container_width=True)
             
             with viz_tab3:
@@ -790,7 +917,6 @@ if st.session_state.analysis_results or st.session_state.individual_comments:
                                             'Comments': 0, 'Subreddit': c['subreddit']})
                     
                     df_timeline = pd.DataFrame(timeline_data).sort_values('Time')
-                    # Create size column with positive values (add offset to handle negative scores)
                     min_score = df_timeline['Score'].min()
                     df_timeline['BubbleSize'] = df_timeline['Score'] + abs(min_score) + 1 if min_score < 0 else df_timeline['Score'] + 1
                     
@@ -807,15 +933,15 @@ if st.session_state.analysis_results or st.session_state.individual_comments:
                                color_discrete_map={'Post': 'blue', 'Comment': 'orange'})
                     st.plotly_chart(fig, use_container_width=True)
     
-    # TAB 6: Detailed Analytics
+    # TAB 6: Analytics
     with tab6:
-        st.header("📉 Detailed Analytics")
+        st.header("📉 Analytics")
         
         if results or individual_comments:
             analytics_tab1, analytics_tab2, analytics_tab3 = st.tabs(["Subreddits", "Keywords", "Users"])
             
             with analytics_tab1:
-                st.subheader("📱 Subreddit Breakdown")
+                st.subheader("📱 Subreddit Breakdown (Input Subreddits)")
                 subreddit_stats = {}
                 
                 for r in results:
@@ -916,8 +1042,159 @@ if st.session_state.analysis_results or st.session_state.individual_comments:
                            title='Top 10 Users by Activity', template=chart_theme, barmode='stack')
                 fig.update_xaxes(tickangle=-45)
                 st.plotly_chart(fig, use_container_width=True)
+    
+    # TAB 7: Network Analysis
+    with tab7:
+        st.header("🌐 Network Analysis")
+        
+        if network_data:
+            st.info("**Network Discovery:** Shows INPUT subreddits and DISCOVERED subreddits where your keywords appear")
+            
+            G_data = network_data['graph']
+            metrics = network_data['metrics']
+            discovered = network_data['discovered_subreddits']
+            
+            # Network overview
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Input Subreddits", len([n for n in G_data['nodes'] if n.get('type') == 'input']))
+            col2.metric("Discovered Subreddits", len([n for n in G_data['nodes'] if n.get('type') == 'discovered']))
+            col3.metric("Total Nodes", len(G_data['nodes']))
+            col4.metric("Connections", len(G_data['links']))
+            
+            st.markdown("---")
+            
+            network_tab1, network_tab2, network_tab3 = st.tabs(["Network Graph", "Centrality Metrics", "Discovered Subreddits"])
+            
+            with network_tab1:
+                st.subheader("📊 Subreddit Network Graph")
+                
+                # Prepare network visualization data
+                G_viz = nx.node_link_graph(G_data)
+                pos = nx.spring_layout(G_viz, k=2, iterations=50)
+                
+                edge_trace = []
+                for edge in G_viz.edges(data=True):
+                    x0, y0 = pos[edge[0]]
+                    x1, y1 = pos[edge[1]]
+                    edge_trace.append(
+                        go.Scatter(x=[x0, x1, None], y=[y0, y1, None],
+                                 mode='lines',
+                                 line=dict(width=0.5 + edge[2].get('weight', 1) * 0.1, color='#888'),
+                                 hoverinfo='none',
+                                 showlegend=False)
+                    )
+                
+                node_trace_input = go.Scatter(
+                    x=[], y=[], text=[], mode='markers+text',
+                    hoverinfo='text',
+                    marker=dict(size=[], color='blue', line_width=2),
+                    textposition="top center",
+                    name='Input Subreddits'
+                )
+                
+                node_trace_discovered = go.Scatter(
+                    x=[], y=[], text=[], mode='markers',
+                    hoverinfo='text',
+                    marker=dict(size=[], color='orange', line_width=1),
+                    name='Discovered Subreddits'
+                )
+                
+                for node in G_viz.nodes(data=True):
+                    x, y = pos[node[0]]
+                    node_data = node[1]
+                    mentions = node_data.get('mentions', 0)
+                    size = 10 + mentions * 2
+                    
+                    if node_data.get('type') == 'input':
+                        node_trace_input['x'] += tuple([x])
+                        node_trace_input['y'] += tuple([y])
+                        node_trace_input['text'] += tuple([f"r/{node[0]}"])
+                        node_trace_input['marker']['size'] += tuple([size])
+                    else:
+                        node_trace_discovered['x'] += tuple([x])
+                        node_trace_discovered['y'] += tuple([y])
+                        node_trace_discovered['text'] += tuple([f"r/{node[0]}<br>Mentions: {mentions}"])
+                        node_trace_discovered['marker']['size'] += tuple([min(size, 30)])
+                
+                fig = go.Figure(data=edge_trace + [node_trace_input, node_trace_discovered],
+                              layout=go.Layout(
+                                  title='Subreddit Network: Input (Blue) vs Discovered (Orange)',
+                                  showlegend=True,
+                                  hovermode='closest',
+                                  margin=dict(b=0,l=0,r=0,t=40),
+                                  xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                                  yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                                  template=chart_theme,
+                                  height=700
+                              ))
+                
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with network_tab2:
+                st.subheader("📈 Centrality Metrics")
+                
+                st.markdown("""
+                **Understanding Centrality:**
+                - **Degree Centrality**: Number of connections (popularity)
+                - **Betweenness Centrality**: Bridge between communities
+                - **PageRank**: Overall importance (Google's algorithm)
+                - **Eigenvector Centrality**: Influence based on connections
+                """)
+                
+                if metrics:
+                    metric_choice = st.selectbox("Select Metric", 
+                                                 ["degree", "betweenness", "pagerank", "eigenvector", "closeness"])
+                    
+                    if metric_choice in metrics:
+                        metric_data = metrics[metric_choice]
+                        df_metrics = pd.DataFrame([
+                            {'Subreddit': f"r/{sub}", 'Score': round(score, 4), 
+                             'Type': 'Input' if any(n['id'] == sub and n.get('type') == 'input' for n in G_data['nodes']) else 'Discovered'}
+                            for sub, score in sorted(metric_data.items(), key=lambda x: x[1], reverse=True)[:20]
+                        ])
+                        
+                        st.dataframe(df_metrics, use_container_width=True, hide_index=True)
+                        
+                        fig = px.bar(df_metrics, x='Subreddit', y='Score', color='Type',
+                                   title=f'Top 20 Subreddits by {metric_choice.title()} Centrality',
+                                   template=chart_theme,
+                                   color_discrete_map={'Input': 'blue', 'Discovered': 'orange'})
+                        fig.update_xaxes(tickangle=-45)
+                        st.plotly_chart(fig, use_container_width=True)
+            
+            with network_tab3:
+                st.subheader("🔍 Discovered Subreddits Details")
+                
+                if discovered:
+                    df_discovered = pd.DataFrame([
+                        {
+                            'Subreddit': f"r/{sub}",
+                            'Mentions': data['mentions'],
+                            'Sample Posts': len(data['posts'][:3])
+                        }
+                        for sub, data in sorted(discovered.items(), key=lambda x: x[1]['mentions'], reverse=True)[:50]
+                    ])
+                    
+                    st.dataframe(df_discovered, use_container_width=True, hide_index=True)
+                    
+                    st.markdown("---")
+                    st.subheader("Sample Posts from Discovered Subreddits")
+                    
+                    selected_sub = st.selectbox("View posts from:", 
+                                               [f"r/{sub}" for sub in list(discovered.keys())[:20]])
+                    
+                    if selected_sub:
+                        sub_name = selected_sub.replace('r/', '')
+                        if sub_name in discovered:
+                            posts = discovered[sub_name]['posts'][:5]
+                            for i, post in enumerate(posts, 1):
+                                with st.expander(f"{i}. {post['title'][:80]}... (↑{post['score']})"):
+                                    st.markdown(f"**Score:** {post['score']}")
+                                    st.markdown(f"🔗 [View on Reddit]({post['url']})")
+                else:
+                    st.info("No discovered subreddits. Enable 'Network Discovery' and add keywords.")
         else:
-            st.info("No analytics data available")
+            st.info("Network analysis not available. Enable 'Network Discovery' in settings and run analysis with keywords.")
 
 else:
     st.info("👈 Configure settings and click **Run Analysis**")
@@ -932,10 +1209,25 @@ else:
     
     ### 📊 Features
     
-    - **AI-Powered Summaries**: Get concise summaries of posts and discussions
-    - **Sentiment Analysis**: Understand positive, neutral, and negative mentions
+    - **AI-Powered Summaries**: Get concise summaries using Gemini
+    - **Sentiment Analysis**: VADER for instant, accurate sentiment detection
     - **Brand Health Score**: Track overall brand perception (0-100)
-    - **Individual Analysis**: Deep dive into specific posts and comments
-    - **Visual Analytics**: Charts, word clouds, and timelines
+    - **Network Discovery**: Find related subreddits where keywords are discussed
+    - **Centrality Metrics**: Analyze subreddit importance and connections
+    - **Visual Analytics**: Charts, word clouds, and network graphs
     - **Export Results**: Download complete analysis as JSON
+    
+    ### 🆕 What's New
+    
+    - ⚡ **VADER Sentiment**: Instant sentiment analysis (no API calls!)
+    - 🌐 **Network Analysis**: Discover related subreddits automatically
+    - 📊 **Centrality Metrics**: Degree, Betweenness, PageRank, Eigenvector, Closeness
+    - 🔗 **Connection Mapping**: Visualize how subreddits relate to each other
+    
+    ### 💡 Tips
+    
+    - **Input Subreddits**: Only analyze data from subreddits YOU specify
+    - **Network Discovery**: Automatically finds OTHER subreddits discussing your keywords
+    - **Network Graph**: Blue nodes = your input, Orange nodes = discovered communities
+    - **VADER Scores**: Compound score ranges from -1 (negative) to +1 (positive)
     """)
